@@ -1,4 +1,4 @@
-# HX Discord Status
+# Discord Status
 
 通过 Discord Gateway WebSocket 设置自定义 Rich Presence 状态的命令行工具。无需运行 Discord 客户端，可在服务器上持续运行。
 
