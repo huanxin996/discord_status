@@ -76,10 +76,48 @@ def fetch_build_number() -> int:
 
 
 # ═══════════════════════════════════════════════════════════
+# 资产管理
+# ═══════════════════════════════════════════════════════════
+
+def fetch_app_assets(app_id: str) -> dict:
+    """从 Discord API 获取 Application 的 Rich Presence 资产列表
+
+    Discord Gateway Activity 中 large_image/small_image 字段要求填写
+    资产的雪花 ID，而非资产名称。本函数返回 名称→ID 的映射字典。
+
+    API 端点 (无需鉴权):
+        GET https://discord.com/api/v10/oauth2/applications/{app_id}/assets
+
+    Args:
+        app_id: Discord Application ID
+
+    Returns:
+        {资产名称: 资产ID字符串} 的字典；请求失败时返回空字典
+    """
+    if not app_id:
+        return {}
+    url = f"https://discord.com/api/v10/oauth2/applications/{app_id}/assets"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": DISCORD_UA},
+        )
+        data = urllib.request.urlopen(req, timeout=10).read()
+        assets = json.loads(data)
+        mapping = {a["name"]: a["id"] for a in assets if "name" in a and "id" in a}
+        log.info("获取到 %d 个资产: %s", len(mapping), list(mapping.keys()))
+        return mapping
+    except Exception as e:
+        log.warning("获取资产列表失败: %s", e)
+        return {}
+
+
+# ═══════════════════════════════════════════════════════════
 # Activity / Presence 构建
 # ═══════════════════════════════════════════════════════════
 
-def build_activity(config: AppConfig, start_ts: float) -> dict:
+def build_activity(config: AppConfig, start_ts: float,
+                   asset_map: dict | None = None) -> dict:
     """根据配置构建 Discord Activity 对象
 
     Args:
@@ -106,13 +144,26 @@ def build_activity(config: AppConfig, start_ts: float) -> dict:
             activity["state"] = config.state
 
         # ── 图标 ──────────────────────────────────────
+        # Discord Gateway 要求 large_image/small_image 填写资产的雪花 ID
+        # 若传入了 asset_map（名称→ID），则自动将名称转换为 ID
+        def resolve_image(key: str) -> str:
+            """将资产名称解析为 ID；若已是纯数字或无映射则原样返回"""
+            if not key:
+                return key
+            if asset_map and key in asset_map:
+                return asset_map[key]
+            # 如果 key 不是纯数字且没有找到映射，输出一次警告
+            if asset_map is not None and not key.isdigit() and not key.startswith("mp:"):
+                log.warning("资产 '%s' 未在资产列表中找到，将原样发送（可能无法显示图标）", key)
+            return key
+
         assets = {}
         if config.large_image_key:
-            assets["large_image"] = config.large_image_key
+            assets["large_image"] = resolve_image(config.large_image_key)
         if config.large_image_text:
             assets["large_text"] = config.large_image_text
         if config.small_image_key:
-            assets["small_image"] = config.small_image_key
+            assets["small_image"] = resolve_image(config.small_image_key)
         if config.small_image_text:
             assets["small_text"] = config.small_image_text
         if assets:
@@ -136,17 +187,19 @@ def build_activity(config: AppConfig, start_ts: float) -> dict:
     return activity
 
 
-def build_presence_payload(config: AppConfig, start_ts: float) -> dict:
+def build_presence_payload(config: AppConfig, start_ts: float,
+                           asset_map: dict | None = None) -> dict:
     """构建完整的 Presence Update 载荷 (Opcode 3)
 
     Args:
         config: 应用配置
         start_ts: 启动时间戳
+        asset_map: 资产名称→ID 映射（由 fetch_app_assets 获取）
 
     Returns:
         可直接发送的 Gateway 载荷字典
     """
-    activity = build_activity(config, start_ts)
+    activity = build_activity(config, start_ts, asset_map)
     return {
         "op": OpCode.PRESENCE_UPDATE,
         "d": {
@@ -201,7 +254,10 @@ class GatewayClient:
         # ── 重连管理 ──────────────────────────────────
         self._reconnect_count = 0         # 当前连续重连次数
         self._max_reconnect = config.max_reconnect_attempts  # 最大重连次数 (0=无限)
-
+        # ── 资产映射缓存 ──────────────────────────
+        # Discord Gateway 要求图标填写资产雪花 ID，而非资产名称
+        # 运行时通过 /oauth2/applications/{id}/assets API 自动获取
+        self._asset_map: dict = {}        # {asset_name: asset_id}
         # ── Gateway 会话状态 ──────────────────────────
         self._heartbeat_interval = 41.25  # 心跳间隔（秒）
         self._sequence = None             # 最新序列号
@@ -286,7 +342,8 @@ class GatewayClient:
         """单次 Gateway 会话的完整生命周期
 
         流程: Hello → Identify/Resume → 心跳 + 监听 + 热更新
-        """
+        """        # ── 0. 刷新资产映射 ───────────────────────────
+        await self._refresh_assets()
         # ── 1. 接收 Hello ─────────────────────────────
         msg = await self._recv()
         if msg is None:
@@ -457,6 +514,21 @@ class GatewayClient:
     # 协议指令
     # ═════════════════════════════════════════════════════
 
+    async def _refresh_assets(self) -> None:
+        """获取并缓存应用资产列表（名称→ID 映射）
+
+        Discord Gateway 要求 large_image/small_image 填写资产ID，
+        此方法通过 API 自动把配置中的资产名称转换为 ID。
+        """
+        app_id = self.config.application_id
+        if not app_id or app_id == "你的ApplicationID":
+            return
+        mapping = await asyncio.to_thread(fetch_app_assets, app_id)
+        if mapping:
+            self._asset_map = mapping
+        elif not self._asset_map:
+            log.warning("资产列表为空，将原样使用配置中的字符串作为图标键（可能无法显示图标）")
+
     async def _send_identify(self) -> None:
         """发送 Identify 载荷 (Opcode 2)
 
@@ -464,7 +536,7 @@ class GatewayClient:
         初始 Presence 和 client_state。
         """
         log.info("发送 Identify ...")
-        activity = build_activity(self.config, self.start_ts)
+        activity = build_activity(self.config, self.start_ts, self._asset_map)
 
         payload = {
             "op": OpCode.IDENTIFY,
@@ -534,7 +606,8 @@ class GatewayClient:
 
         根据当前配置构建并发送状态更新。
         """
-        payload = build_presence_payload(self.config, self.start_ts)
+        payload = build_presence_payload(self.config, self.start_ts, self._asset_map)
+        await self._send(payload)
         await self._send(payload)
         log.info("状态已更新: %s | %s — %s",
                  self.config.game_name,

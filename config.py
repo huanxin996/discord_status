@@ -207,20 +207,12 @@ class AppConfig:
         return "DEBUG"
 
     @property
-    def max_log_size_mb(self) -> float:
-        """单个日志文件最大大小 (MB)"""
+    def log_retention_days(self) -> int:
+        """日志文件保留天数（超期自动删除，0 = 永久保留）"""
         log_cfg = self._raw.get("logging", {})
         if isinstance(log_cfg, dict):
-            return float(log_cfg.get("max_file_size_mb", 5))
-        return 5.0
-
-    @property
-    def log_backup_count(self) -> int:
-        """保留的历史日志文件数量"""
-        log_cfg = self._raw.get("logging", {})
-        if isinstance(log_cfg, dict):
-            return int(log_cfg.get("backup_count", 5))
-        return 5
+            return int(log_cfg.get("log_retention_days", 7))
+        return 7
 
     # ═════════════════════════════════════════════════════
     # 核心方法

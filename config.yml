@@ -102,11 +102,9 @@ logging:
   # 文件记录最低等级: DEBUG / INFO / WARNING / ERROR
   file_level: "DEBUG"
 
-  # 单个日志文件最大大小（MB），超过自动轮转
-  max_file_size_mb: 5
-
-  # 保留的历史日志文件数量
-  backup_count: 5
+  # 历史日志文件保留天数（超出则自动删除，0 = 永久保留）
+  # 文件按日期命名: discord_status_YYYY-MM-DD.log
+  log_retention_days: 7
 
 
 # ==================================================================

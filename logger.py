@@ -2,17 +2,20 @@
 HX Discord Status — 日志模块 (logger.py)
 
 提供统一的日志管理：
-  - 控制台输出：彩色分级，可配置最低等级
-  - 文件记录：自适应大小轮转，保存在 log/ 目录下
-  - 支持自定义控制台 / 文件记录等级分离
-  - 使用 RotatingFileHandler 实现自动轮转
+  - 控制台输出：可配置最低等级
+  - 文件记录：按日期自动轮转，每天生成一个独立文件
+  - 文件命名格式: discord_status_YYYY-MM-DD.log
+  - 日志保留天数可配置，超期文件自动清理
+  - 支持控制台 / 文件记录等级独立配置
 
 无内部项目依赖，可被任何模块安全导入。
 """
 
 import logging
+import re
 import sys
-from logging.handlers import RotatingFileHandler
+from datetime import date, datetime, timedelta
+from logging.handlers import BaseRotatingHandler
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════
@@ -22,8 +25,8 @@ from pathlib import Path
 # 日志根目录（项目根目录下的 log/ 文件夹）
 LOG_DIR = Path(__file__).parent / "log"
 
-# 日志文件名
-LOG_FILENAME = "discord_status.log"
+# 日志文件基础名称（不含日期和扩展名）
+LOG_BASE_NAME = "discord_status"
 
 # 根 Logger 名称（所有子模块使用 "hx_discord.<module>" 格式）
 ROOT_LOGGER_NAME = "hx_discord"
@@ -44,24 +47,117 @@ _initialized = False
 
 
 # ═══════════════════════════════════════════════════════════
+# 日期轮转 Handler
+# ═══════════════════════════════════════════════════════════
+
+class DateRotatingFileHandler(BaseRotatingHandler):
+    """按日期轮转的文件日志 Handler
+
+    - 文件命名：{base_name}_{YYYY-MM-DD}.log
+    - 每天零点（首条日志触发检测）自动轮转到新文件
+    - 启动时自动清理超出保留天数的历史文件
+    """
+
+    #: 日志文件名匹配模式（用于清理旧文件）
+    _FILENAME_RE = re.compile(r'^(.+)_(\d{4}-\d{2}-\d{2})\.log$')
+
+    def __init__(
+        self,
+        log_dir: Path,
+        base_name: str,
+        retention_days: int = 7,
+        encoding: str = "utf-8",
+    ):
+        """
+        Args:
+            log_dir:        日志存放目录
+            base_name:      文件基础名称（不含日期和 .log 后缀）
+            retention_days: 保留历史日志的天数（超出则删除）
+            encoding:       文件编码
+        """
+        self.log_dir = log_dir
+        self.base_name = base_name
+        self.retention_days = retention_days
+        self._current_date: date = datetime.now().date()
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+        filepath = self._get_filepath(self._current_date)
+
+        super().__init__(str(filepath), mode="a", encoding=encoding, delay=False)
+
+        # 启动时清理超期文件
+        self._cleanup_old_logs()
+
+    # ── 文件路径 ───────────────────────────────────────
+
+    def _get_filepath(self, log_date: date) -> Path:
+        """根据日期生成日志文件路径"""
+        return self.log_dir / f"{self.base_name}_{log_date.strftime('%Y-%m-%d')}.log"
+
+    # ── 轮转判断 ───────────────────────────────────────
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+        """检查是否需要轮转（日期变更时返回 True）"""
+        return datetime.now().date() != self._current_date
+
+    def doRollover(self) -> None:
+        """执行轮转：关闭当前文件，切换到新日期文件，清理旧文件"""
+        if self.stream:
+            self.stream.close()
+            self.stream = None  # type: ignore[assignment]
+
+        self._current_date = datetime.now().date()
+        self.baseFilename = str(self._get_filepath(self._current_date))
+        self.stream = self._open()
+
+        self._cleanup_old_logs()
+
+    # ── 旧文件清理 ─────────────────────────────────────
+
+    def _cleanup_old_logs(self) -> None:
+        """删除超出保留天数的历史日志文件
+
+        通过文件名中的日期字段判断，只处理符合命名规则的文件。
+        """
+        if self.retention_days <= 0:
+            return
+
+        cutoff: date = datetime.now().date() - timedelta(days=self.retention_days)
+
+        try:
+            for f in self.log_dir.iterdir():
+                if not f.is_file():
+                    continue
+                m = self._FILENAME_RE.match(f.name)
+                if not m or m.group(1) != self.base_name:
+                    continue
+                try:
+                    file_date = datetime.strptime(m.group(2), "%Y-%m-%d").date()
+                    if file_date < cutoff:
+                        f.unlink()
+                except (ValueError, OSError):
+                    pass
+        except OSError:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════
 # 公开接口
 # ═══════════════════════════════════════════════════════════
 
 def setup_logger(
     console_level: str = "INFO",
     file_level: str = "DEBUG",
-    max_file_size_mb: float = 5.0,
-    backup_count: int = 5,
+    log_retention_days: int = 7,
 ) -> logging.Logger:
     """初始化并配置项目根 Logger
 
     应在程序启动时调用一次。后续通过 get_logger() 获取子 Logger。
 
     Args:
-        console_level:   控制台输出最低等级 (DEBUG / INFO / WARNING / ERROR)
-        file_level:      文件记录最低等级 (DEBUG / INFO / WARNING / ERROR)
-        max_file_size_mb: 单个日志文件最大大小（MB），超过自动轮转
-        backup_count:    保留的历史日志文件数量
+        console_level:      控制台输出最低等级 (DEBUG / INFO / WARNING / ERROR)
+        file_level:         文件记录最低等级 (DEBUG / INFO / WARNING / ERROR)
+        log_retention_days: 日志文件保留天数，超出则自动删除（0 = 永久保留）
 
     Returns:
         配置完成的根 logging.Logger 实例
@@ -77,17 +173,11 @@ def setup_logger(
     # 根 Logger 设为 DEBUG，由各 Handler 各自过滤
     logger.setLevel(logging.DEBUG)
 
-    # ── 创建日志目录 ──────────────────────────────────
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ── 文件 Handler（自适应大小轮转） ────────────────
-    log_file = LOG_DIR / LOG_FILENAME
-    max_bytes = int(max_file_size_mb * 1024 * 1024)
-
-    file_handler = RotatingFileHandler(
-        filename=str(log_file),
-        maxBytes=max_bytes,
-        backupCount=backup_count,
+    # ── 文件 Handler（按日期轮转） ────────────────────
+    file_handler = DateRotatingFileHandler(
+        log_dir=LOG_DIR,
+        base_name=LOG_BASE_NAME,
+        retention_days=log_retention_days,
         encoding="utf-8",
     )
     file_handler.setLevel(_parse_level(file_level))
@@ -105,8 +195,10 @@ def setup_logger(
     logger.addHandler(console_handler)
 
     _initialized = True
-    logger.debug("日志系统初始化完成 (控制台=%s, 文件=%s, 轮转=%.1fMB×%d)",
-                 console_level, file_level, max_file_size_mb, backup_count)
+    logger.debug(
+        "日志系统初始化完成 (控制台=%s, 文件=%s, 保留=%d天)",
+        console_level, file_level, log_retention_days,
+    )
 
     return logger
 
@@ -146,6 +238,5 @@ def _parse_level(level_str: str) -> int:
     """
     level = getattr(logging, level_str.upper(), None)
     if level is None:
-        # 回退到 INFO
         level = logging.INFO
     return level

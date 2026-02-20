@@ -45,8 +45,7 @@ def main() -> None:
     setup_logger(
         console_level=config.console_level,
         file_level=config.file_level,
-        max_file_size_mb=config.max_log_size_mb,
-        backup_count=config.log_backup_count,
+        log_retention_days=config.log_retention_days,
     )
     log = get_logger("main")
 
