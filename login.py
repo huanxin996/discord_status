@@ -60,6 +60,7 @@ def print_qr_terminal(url: str) -> None:
     Args:
         url: 要编码的 URL
     """
+    log.debug("生成 QR 码: %s", url)
     if qrcode:
         qr = qrcode.QRCode(
             version=1,
@@ -90,6 +91,7 @@ def print_qr_terminal(url: str) -> None:
             lines.append(line)
         print("\n".join(lines))
     else:
+        log.warning("未安装 qrcode 库，无法在终端显示二维码")
         print("  (未安装 qrcode 库，无法显示二维码)")
         print("  请将以下链接粘贴到任意 QR 码生成器中：")
 
@@ -129,8 +131,10 @@ async def qr_login() -> str | None:
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
     encoded_public_key = base64.b64encode(pub_der).decode()
+    log.debug("公钥已编码, 长度: %d 字符", len(encoded_public_key))
 
     log.info("连接 Discord Remote Auth Gateway ...")
+    log.debug("Gateway 地址: %s", REMOTE_AUTH_URL)
 
     try:
         async with websockets.connect(
@@ -142,14 +146,17 @@ async def qr_login() -> str | None:
             # ── 1. 接收 Hello ─────────────────────────
             msg = await _recv_skip_ack(ws, expect_op="hello", timeout=10)
             if msg is None:
+                log.error("未收到 Hello 消息，连接失败")
                 return None
             heartbeat_interval = msg.get("heartbeat_interval", 41250) / 1000
+            log.debug("Remote Auth 心跳间隔: %.2fs", heartbeat_interval)
 
             # ── 启动心跳协程 ──────────────────────────
             hb_task = asyncio.create_task(_heartbeat(ws, heartbeat_interval))
 
             try:
                 # ── 2. 发送 init ──────────────────────
+                log.debug("发送 init 消息，附带公钥")
                 await ws.send(json.dumps({
                     "op": "init",
                     "encoded_public_key": encoded_public_key,
@@ -158,8 +165,10 @@ async def qr_login() -> str | None:
                 # ── 3. nonce_proof 挑战 ───────────────
                 msg = await _recv_skip_ack(ws, expect_op="nonce_proof", timeout=10)
                 if msg is None:
+                    log.error("未收到 nonce_proof 挑战")
                     return None
 
+                log.debug("解密 nonce 并生成 proof...")
                 encrypted_nonce = base64.b64decode(msg["encrypted_nonce"])
                 decrypted_nonce = private_key.decrypt(
                     encrypted_nonce,
@@ -172,6 +181,7 @@ async def qr_login() -> str | None:
                 nonce_hash = hashlib.sha256(decrypted_nonce).digest()
                 proof = base64.urlsafe_b64encode(nonce_hash).rstrip(b"=").decode()
 
+                log.debug("发送 nonce_proof 响应")
                 await ws.send(json.dumps({
                     "op": "nonce_proof",
                     "proof": proof,
@@ -180,9 +190,11 @@ async def qr_login() -> str | None:
                 # ── 4. pending_remote_init → QR 码 ────
                 msg = await _recv_skip_ack(ws, expect_op="pending_remote_init", timeout=10)
                 if msg is None:
+                    log.error("未收到 pending_remote_init 响应")
                     return None
 
                 fingerprint = msg["fingerprint"]
+                log.debug("收到 fingerprint: %s", fingerprint)
                 qr_url = f"https://discord.com/ra/{fingerprint}"
 
                 print()
@@ -203,7 +215,10 @@ async def qr_login() -> str | None:
 
                 # ── 6. ticket → encrypted_token ───────
                 log.info("正在换取 Token ...")
+                log.debug("使用 ticket 换取加密 Token, ticket 长度: %d", len(ticket))
                 token = await _exchange_ticket(ticket, private_key)
+                if token:
+                    log.debug("Token 解密成功, 长度: %d", len(token))
                 return token
 
             finally:
@@ -230,6 +245,7 @@ async def _recv_skip_ack(ws, expect_op: str, timeout: float) -> dict | None:
         消息字典，超时或操作码不匹配返回 None
     """
     deadline = time.time() + timeout
+    log.debug("等待消息: 期望 op=%s, 超时=%.1fs", expect_op, timeout)
     while time.time() < deadline:
         remaining = deadline - time.time()
         try:
@@ -238,8 +254,10 @@ async def _recv_skip_ack(ws, expect_op: str, timeout: float) -> dict | None:
             break
         msg = json.loads(raw)
         if msg.get("op") == "heartbeat_ack":
+            log.debug("跳过 heartbeat_ack")
             continue
         if msg.get("op") == expect_op:
+            log.debug("收到期望的 op=%s", expect_op)
             return msg
         log.warning("期望 %s，收到: %s", expect_op, msg.get("op"))
         return None
@@ -249,11 +267,14 @@ async def _recv_skip_ack(ws, expect_op: str, timeout: float) -> dict | None:
 
 async def _heartbeat(ws, interval: float) -> None:
     """Remote Auth Gateway 心跳协程"""
+    log.debug("Remote Auth 心跳协程启动, 间隔: %.2fs", interval)
     while True:
         await asyncio.sleep(interval)
         try:
             await ws.send(json.dumps({"op": "heartbeat"}))
-        except Exception:
+            log.debug("Remote Auth 心跳包已发送")
+        except Exception as e:
+            log.debug("Remote Auth 心跳发送失败: %s", e)
             break
 
 
@@ -269,19 +290,23 @@ async def _wait_for_ticket(ws, private_key, timeout: float) -> str | None:
         ticket 字符串，超时/取消返回 None
     """
     deadline = time.time() + timeout
+    log.debug("等待扫码确认, 超时: %.0fs", timeout)
 
     while time.time() < deadline:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=5)
         except asyncio.TimeoutError:
+            log.debug("等待扫码中... (剩余 %.0fs)", deadline - time.time())
             continue
-        except Exception:
+        except Exception as e:
+            log.warning("等待扫码时连接异常: %s", e)
             break
 
         msg = json.loads(raw)
         op = msg.get("op")
 
         if op == "heartbeat_ack":
+            log.debug("跳过 heartbeat_ack")
             continue
 
         if op == "pending_ticket":
@@ -304,12 +329,14 @@ async def _wait_for_ticket(ws, private_key, timeout: float) -> str | None:
                     name = uname if discrim == "0" else f"{uname}#{discrim}"
                     log.info("检测到账号: %s (ID: %s)", name, uid)
                     log.info("请在手机上点击「确认登录」...")
-            except Exception:
+            except Exception as e:
+                log.debug("解密用户信息失败: %s", e)
                 log.info("已检测到扫码，等待确认 ...")
             continue
 
         if op == "pending_login":
             log.info("用户已确认登录！")
+            log.debug("ticket 长度: %d", len(msg.get("ticket", "")))
             return msg["ticket"]
 
         if op == "cancel":
@@ -329,14 +356,20 @@ async def _exchange_ticket(ticket: str, private_key) -> str | None:
     Returns:
         明文 Token 字符串，失败返回 None
     """
+    url = f"{DISCORD_API}/users/@me/remote-auth/login"
+    log.debug("发送 Token 换取请求: POST %s", url)
     req = urllib.request.Request(
-        f"{DISCORD_API}/users/@me/remote-auth/login",
+        url,
         data=json.dumps({"ticket": ticket}).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": DISCORD_UA,
+        },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
+            log.debug("Token 换取响应状态码: %d", resp.status)
             result = json.loads(resp.read())
     except Exception as e:
         log.error("Token 换取失败: %s", e)
@@ -344,10 +377,11 @@ async def _exchange_ticket(ticket: str, private_key) -> str | None:
 
     encrypted_token_b64 = result.get("encrypted_token")
     if not encrypted_token_b64:
-        log.error("响应中缺少 encrypted_token")
+        log.error("响应中缺少 encrypted_token, 响应键: %s", list(result.keys()))
         return None
 
     # RSA-OAEP SHA-256 解密
+    log.debug("开始 RSA-OAEP 解密 Token...")
     encrypted_token = base64.b64decode(encrypted_token_b64)
     token = private_key.decrypt(
         encrypted_token,
@@ -375,9 +409,10 @@ def try_local_extract() -> str | None:
         Token 字符串，失败/不支持返回 None
     """
     if sys.platform != "win32":
-        log.warning("本地提取仅支持 Windows 平台")
+        log.warning("本地提取仅支持 Windows 平台, 当前: %s", sys.platform)
         return None
 
+    log.debug("开始本地 Token 提取流程...")
     import ctypes
     import ctypes.wintypes
 
@@ -408,13 +443,17 @@ def try_local_extract() -> str | None:
 
     # ── 遍历 Discord 客户端目录 ───────────────────────
     appdata = os.environ.get("APPDATA", "")
+    log.debug("APPDATA 路径: %s", appdata)
     for variant in ("discord", "discordcanary", "discordptb"):
         app_dir = Path(appdata) / variant
         local_state = app_dir / "Local State"
         leveldb = app_dir / "Local Storage" / "leveldb"
 
         if not local_state.exists() or not leveldb.exists():
+            log.debug("跳过 %s: 目录不存在", variant)
             continue
+
+        log.debug("扫描 %s 客户端目录: %s", variant, app_dir)
 
         # 读取并解密 master key
         try:
@@ -424,11 +463,15 @@ def try_local_extract() -> str | None:
             encrypted_key = base64.b64decode(b64_key)[5:]  # 跳过 "DPAPI" 前缀
             master_key = dpapi_decrypt(encrypted_key)
             if not master_key:
+                log.warning("%s: DPAPI 解密 master key 失败", variant)
                 continue
-        except Exception:
+            log.debug("%s: master key 解密成功, 长度: %d", variant, len(master_key))
+        except Exception as e:
+            log.debug("%s: 读取 Local State 失败: %s", variant, e)
             continue
 
         # 在 LevelDB 中搜索加密 Token
+        log.debug("%s: 扫描 LevelDB 目录: %s", variant, leveldb)
         token_pattern = re.compile(r"dQw4w9WgXcQ:[A-Za-z0-9+/=]+")
         for db_file in sorted(
             leveldb.iterdir(),
@@ -456,12 +499,16 @@ def try_local_extract() -> str | None:
                             token,
                         ):
                             log.info("从 %s 成功提取 Token", variant)
+                            log.debug("Token 来源文件: %s", db_file.name)
                             return token
-                    except Exception:
+                    except Exception as e:
+                        log.debug("解密候选 Token 失败: %s", e)
                         continue
-            except Exception:
+            except Exception as e:
+                log.debug("读取 LevelDB 文件失败 (%s): %s", db_file.name, e)
                 continue
 
+    log.debug("未在任何 Discord 客户端中找到有效 Token")
     return None
 
 
@@ -478,6 +525,7 @@ def verify_token(token: str) -> dict | None:
     Returns:
         用户信息字典 (id, username, discriminator, ...)，无效返回 None
     """
+    log.debug("验证 Token: %s...", token[:8] if len(token) > 8 else "***")
     try:
         req = urllib.request.Request(
             "https://discord.com/api/v10/users/@me",
@@ -486,11 +534,15 @@ def verify_token(token: str) -> dict | None:
                 "User-Agent": DISCORD_UA,
             },
         )
+        log.debug("发送 Token 验证请求: GET /users/@me")
         with urllib.request.urlopen(req, timeout=8) as resp:
             if resp.status == 200:
-                return json.loads(resp.read())
-    except Exception:
-        pass
+                user_data = json.loads(resp.read())
+                log.debug("Token 验证成功, 用户ID: %s", user_data.get("id", "?"))
+                return user_data
+            log.warning("Token 验证返回非 200 状态码: %d", resp.status)
+    except Exception as e:
+        log.warning("Token 验证请求失败: %s", e)
     return None
 
 
@@ -515,6 +567,7 @@ def run_login() -> None:
     print()
 
     choice = input("  请选择登录方式 (1/2/3): ").strip()
+    log.debug("用户选择登录方式: %s", choice)
     token = None
 
     if choice == "1":
@@ -536,6 +589,7 @@ def run_login() -> None:
             return
 
     else:
+        log.warning("无效选择 '%s'，默认使用 QR 码登录", choice)
         print("[提示] 无效选择，默认使用 QR 码登录")
         print()
         token = asyncio.run(qr_login())

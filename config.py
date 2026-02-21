@@ -227,32 +227,45 @@ class AppConfig:
         Raises:
             ConfigError: 文件缺失、格式错误或 Token 缺失
         """
+        log.debug("加载配置文件: %s (strict=%s)", self._path, strict)
+
         if not self._path.exists():
+            log.error("配置文件不存在: %s", self._path)
             raise ConfigError(f"找不到配置文件: {self._path}")
 
         with open(self._path, "r", encoding="utf-8") as f:
             raw_text = f.read()
+        log.debug("配置文件读取完成, 大小: %d 字节", len(raw_text))
 
         try:
             self._raw = yaml.safe_load(raw_text) or {}
         except yaml.YAMLError as e:
+            log.error("YAML 解析失败: %s", e)
             raise ConfigError(f"config.yml 格式错误: {e}")
 
         # 类型保护：确保解析结果是字典
         if not isinstance(self._raw, dict):
+            log.error("配置文件顶层结构不是字典, 实际类型: %s", type(self._raw).__name__)
             raise ConfigError("config.yml 顶层结构必须是映射（字典）")
 
         # 严格模式下校验 Token
         if strict:
             token = self.token
             if not token or token == "你的Token":
+                log.error("Token 未配置或为默认占位值")
                 raise ConfigError(
                     "请先在 config.yml 中填入你的 Discord Token\n"
                     "  运行 python login.py 可自动获取并写入"
                 )
+            log.debug("Token 校验通过 (前8位: %s...)", token[:8])
 
         # 计算内容哈希（用于热更新检测）
         self._hash = json.dumps(self._raw, sort_keys=True, ensure_ascii=False)
+
+        log.debug("配置加载完成: game_name=%r, status=%r, activity_type=%d",
+                  self.game_name, self.status, self.activity_type)
+        log.debug("时间模式: %s, 重连延迟: %ds, 热更新间隔: %ds",
+                  self.start_time_mode, self.reconnect_delay, self.config_reload_interval)
 
     def has_changed(self) -> bool:
         """检测配置文件内容是否有变更
@@ -266,8 +279,12 @@ class AppConfig:
             with open(self._path, "r", encoding="utf-8") as f:
                 new_raw = yaml.safe_load(f.read()) or {}
             new_hash = json.dumps(new_raw, sort_keys=True, ensure_ascii=False)
-            return new_hash != self._hash
-        except Exception:
+            changed = new_hash != self._hash
+            if changed:
+                log.debug("检测到配置文件变更")
+            return changed
+        except Exception as e:
+            log.warning("检测配置变更时出错: %s", e)
             return False
 
     def reload(self) -> bool:
@@ -294,8 +311,10 @@ class AppConfig:
         """
         minutes = round(minutes, 1)
         if not self._path.exists():
+            log.warning("配置文件不存在，无法保存 auto_save_minutes")
             return
 
+        log.debug("保存 auto_save_minutes: %.1f", minutes)
         content = self._path.read_text(encoding="utf-8")
         if re.search(r"^auto_save_minutes\s*:", content, flags=re.MULTILINE):
             new_content = re.sub(
@@ -332,6 +351,7 @@ class AppConfig:
         Args:
             token: 新的 Discord 用户 Token
         """
+        log.debug("更新 Token (前8位: %s...)", token[:8] if len(token) > 8 else "***")
         if self._path.exists():
             content = self._path.read_text(encoding="utf-8")
             # 匹配 token: "xxx" 或 token: xxx 或 token: 'xxx' 格式

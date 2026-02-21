@@ -30,6 +30,8 @@ def main() -> None:
     if "--login" in sys.argv:
         # 初始化基础日志（使用默认设置）
         setup_logger(console_level="INFO", file_level="DEBUG")
+        log = get_logger("main")
+        log.info("进入登录模式 (--login)")
         from login import run_login
         run_login()
         return
@@ -48,7 +50,10 @@ def main() -> None:
         log_retention_days=config.log_retention_days,
     )
     log = get_logger("main")
-
+    log.info("程序启动")
+    log.debug("配置加载完成: %r", config)
+    log.debug("日志配置: console=%s, file=%s, 保留=%d天",
+             config.console_level, config.file_level, config.log_retention_days)
     # ── 3. 启动信息 ──────────────────────────────────
     print("=" * 50)
     print("  HX Discord Status  (Gateway / 模块化版)")
@@ -63,6 +68,7 @@ def main() -> None:
     # ── 4. 获取 Build Number ─────────────────────────
     log.info("正在获取最新 Discord Build Number ...")
     build_num = fetch_build_number()
+    log.debug("使用 Build Number: %d", build_num)
     print()
 
     # ── 5. 创建并启动 Gateway 客户端 ─────────────────
@@ -70,9 +76,11 @@ def main() -> None:
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    log.debug("事件循环已创建")
 
     # 优雅退出处理
     def _stop():
+        log.info("触发优雅停止流程...")
         client.stop()
         for task in asyncio.all_tasks(loop):
             task.cancel()
@@ -81,18 +89,24 @@ def main() -> None:
     if sys.platform != "win32":
         loop.add_signal_handler(signal.SIGINT, _stop)
         loop.add_signal_handler(signal.SIGTERM, _stop)
+        log.debug("已注册 Unix 信号处理器 (SIGINT/SIGTERM)")
+    else:
+        log.debug("Windows 平台，使用 KeyboardInterrupt 处理退出")
 
     try:
+        log.info("启动 Gateway 客户端主循环")
         loop.run_until_complete(client.run())
     except KeyboardInterrupt:
         log.info("收到退出信号 (Ctrl+C)")
         _stop()
     finally:
         # 清理残留异步任务
+        log.debug("清理异步任务...")
         pending = asyncio.all_tasks(loop)
         for task in pending:
             task.cancel()
         if pending:
+            log.debug("取消 %d 个残留任务", len(pending))
             loop.run_until_complete(
                 asyncio.gather(*pending, return_exceptions=True)
             )

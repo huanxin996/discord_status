@@ -42,8 +42,9 @@ _CONSOLE_FORMAT = "[%(asctime)s] [%(levelname)s] %(message)s"
 # 时间格式
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-# 模块级初始化标记，防止多次调用 setup_logger
-_initialized = False
+# 模块级初始化标记
+_initialized = False   # 是否已完成基础初始化（默认参数）
+_configured = False    # 是否已使用用户自定义配置初始化（来自 config.yml）
 
 
 # ═══════════════════════════════════════════════════════════
@@ -152,7 +153,15 @@ def setup_logger(
 ) -> logging.Logger:
     """初始化并配置项目根 Logger
 
-    应在程序启动时调用一次。后续通过 get_logger() 获取子 Logger。
+    支持两阶段初始化（参考 logger2.py 的单例重配置模式）：
+      1. 懒初始化阶段：模块导入时 get_logger() 自动以默认参数调用，
+         保证早期日志不丢失。
+      2. 用户配置阶段：main.py 从 config.yml 读取配置后再次调用，
+         传入自定义参数，覆盖默认 Handler 设置。
+
+    判断逻辑（与 logger2.py 的 _configured 标记一致）：
+      - 已用用户配置初始化过 + 本次是默认参数 → 跳过（不重复配置）
+      - 未初始化 / 本次传入自定义参数        → 执行（重新）配置
 
     Args:
         console_level:      控制台输出最低等级 (DEBUG / INFO / WARNING / ERROR)
@@ -162,13 +171,28 @@ def setup_logger(
     Returns:
         配置完成的根 logging.Logger 实例
     """
-    global _initialized
+    global _initialized, _configured
 
     logger = logging.getLogger(ROOT_LOGGER_NAME)
 
-    # 防止重复添加 handler
-    if _initialized:
+    # ── 判断本次调用是否携带用户自定义配置 ────────────
+    is_custom = (
+        console_level != "INFO"
+        or file_level != "DEBUG"
+        or log_retention_days != 7
+    )
+
+    # 已经用用户配置初始化过，且本次是默认参数调用 → 跳过
+    if _configured and not is_custom:
         return logger
+
+    # 已经用默认参数初始化过，且本次仍是默认参数 → 跳过
+    if _initialized and not is_custom:
+        return logger
+
+    # ── 需要（重新）配置：清理旧 Handler ─────────────
+    if _initialized:
+        logger.handlers.clear()
 
     # 根 Logger 设为 DEBUG，由各 Handler 各自过滤
     logger.setLevel(logging.DEBUG)
@@ -194,9 +218,14 @@ def setup_logger(
     )
     logger.addHandler(console_handler)
 
+    # ── 更新状态标记 ─────────────────────────────────
     _initialized = True
+    if is_custom:
+        _configured = True
+
     logger.debug(
-        "日志系统初始化完成 (控制台=%s, 文件=%s, 保留=%d天)",
+        "日志系统%s完成 (控制台=%s, 文件=%s, 保留=%d天)",
+        "重新配置" if is_custom else "初始化",
         console_level, file_level, log_retention_days,
     )
 
@@ -205,6 +234,13 @@ def setup_logger(
 
 def get_logger(name: str = "") -> logging.Logger:
     """获取子 Logger
+
+    如果 setup_logger() 尚未被调用，会自动以默认参数执行懒初始化，
+    确保在 main.py 显式调用 setup_logger() 之前，模块导入阶段产生
+    的日志也能被正常记录（不会丢失）。
+
+    后续 main.py 使用用户配置调用 setup_logger() 时，会自动清理默认
+    Handler 并用新配置重建，已获取的子 Logger 无需重新获取。
 
     Args:
         name: 子模块名称（如 "gateway"、"login"、"config"）
@@ -218,6 +254,10 @@ def get_logger(name: str = "") -> logging.Logger:
         log.info("连接成功")
         # 输出: [2026-02-20 12:00:00] [INFO] [hx_discord.gateway] 连接成功
     """
+    # 懒初始化：首次调用 get_logger() 时自动用默认参数配置
+    if not _initialized:
+        setup_logger()
+
     if name:
         return logging.getLogger(f"{ROOT_LOGGER_NAME}.{name}")
     return logging.getLogger(ROOT_LOGGER_NAME)

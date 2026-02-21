@@ -63,12 +63,14 @@ def fetch_build_number() -> int:
             DISCORD_APP_URL,
             headers={"User-Agent": DISCORD_UA},
         )
+        log.debug("请求 Discord App 页面获取 Build Number: %s", DISCORD_APP_URL)
         html = urllib.request.urlopen(req, timeout=10).read().decode()
         m = re.search(r'"BUILD_NUMBER"\s*:\s*"(\d+)"', html)
         if m:
             build_num = int(m.group(1))
             log.info("获取到 Build Number: %d", build_num)
             return build_num
+        log.warning("页面中未找到 BUILD_NUMBER 字段")
     except Exception as e:
         log.warning("获取 Build Number 失败: %s, 使用默认值 %d", e, DEFAULT_BUILD_NUMBER)
 
@@ -95,6 +97,7 @@ def fetch_app_assets(app_id: str) -> dict:
         {资产名称: 资产ID字符串} 的字典；请求失败时返回空字典
     """
     if not app_id:
+        log.debug("未配置 application_id，跳过资产获取")
         return {}
     url = f"https://discord.com/api/v10/oauth2/applications/{app_id}/assets"
     try:
@@ -102,6 +105,7 @@ def fetch_app_assets(app_id: str) -> dict:
             url,
             headers={"User-Agent": DISCORD_UA},
         )
+        log.debug("获取应用资产列表: %s", url)
         data = urllib.request.urlopen(req, timeout=10).read()
         assets = json.loads(data)
         mapping = {a["name"]: a["id"] for a in assets if "name" in a and "id" in a}
@@ -131,6 +135,7 @@ def build_activity(config: AppConfig, start_ts: float,
         "name": config.game_name,
         "type": config.activity_type,
     }
+    log.debug("构建 Activity: name=%r, type=%d", config.game_name, config.activity_type)
 
     # 有 application_id 时启用富文本功能
     app_id = config.application_id
@@ -179,9 +184,13 @@ def build_activity(config: AppConfig, start_ts: float,
     mode = config.start_time_mode
     if mode == "auto":
         activity["timestamps"] = {"start": int(start_ts * 1000)}
+        log.debug("时间戳模式: auto, start_ts=%d", int(start_ts))
     elif mode == "custom":
         fake_start = time.time() - (config.custom_elapsed_minutes * 60)
         activity["timestamps"] = {"start": int(fake_start * 1000)}
+        log.debug("时间戳模式: custom, 自定义已运行 %d 分钟", config.custom_elapsed_minutes)
+    else:
+        log.debug("时间戳模式: none, 不附加时间戳")
     # mode == "none" → 不附加时间戳
 
     return activity
@@ -200,6 +209,8 @@ def build_presence_payload(config: AppConfig, start_ts: float,
         可直接发送的 Gateway 载荷字典
     """
     activity = build_activity(config, start_ts, asset_map)
+    log.debug("构建 Presence 载荷: status=%s, activities=%d个",
+             config.status, 1)
     return {
         "op": OpCode.PRESENCE_UPDATE,
         "d": {
@@ -236,6 +247,8 @@ class GatewayClient:
         """
         self.config = config
         self.build_number = build_number
+
+        log.debug("初始化 GatewayClient: build_number=%d", build_number)
 
         # ── 连接状态 ──────────────────────────────────
         self._ws = None                   # WebSocket 连接对象
@@ -282,6 +295,7 @@ class GatewayClient:
             try:
                 # 优先使用 resume_url，否则使用默认网关地址
                 url = self._resume_url or GATEWAY_URL
+                log.debug("正在连接 Gateway: %s", url)
                 async with websockets.connect(
                     url,
                     max_size=2 ** 20,
@@ -292,6 +306,7 @@ class GatewayClient:
                     self._inflator = zlib.decompressobj()
                     delay = self.config.reconnect_delay  # 成功连接后重置退避
                     self._reconnect_count = 0            # 成功连接重置计数器
+                    log.info("WebSocket 连接已建立")
                     await self._session()
 
             except asyncio.CancelledError:
@@ -359,8 +374,10 @@ class GatewayClient:
 
         # ── 2. Identify 或 Resume ─────────────────────
         if self._session_id and self._sequence is not None:
+            log.debug("存在历史会话，尝试 Resume")
             await self._send_resume()
         else:
+            log.debug("无历史会话，发送 Identify")
             await self._send_identify()
 
         # ── 3. 启动后台任务 ───────────────────────────
@@ -413,15 +430,19 @@ class GatewayClient:
                 self._sequence = seq
 
             # ── 事件分发 (op=0) ───────────────────────
-            if op == OpCode.DISPATCH:
+            if op == OpCode.DISPATCH:                
+                event = msg.get("t", "UNKNOWN")
+                log.debug("收到 DISPATCH 事件: %s (seq=%s)", event, seq)                
                 await self._handle_dispatch(msg)
 
             # ── 服务端要求心跳 (op=1) ─────────────────
             elif op == OpCode.HEARTBEAT:
+                log.debug("收到服务端要求心跳")
                 await self._send_heartbeat()
 
-            # ── 心跳确认 (op=11) ──────────────────────
+            # ── 心跳确认 (op=11) ──────────────────
             elif op == OpCode.HEARTBEAT_ACK:
+                log.debug("心跳已确认 (ACK)")
                 self._heartbeat_acked = True
 
             # ── 服务端要求重连 (op=7) ─────────────────
@@ -486,6 +507,7 @@ class GatewayClient:
         if isinstance(raw, bytes):
             buf = self._inflator.decompress(raw)
             if raw[-4:] != ZLIB_SUFFIX:
+                log.debug("收到不完整 zlib 帧 (%d 字节)，等待后续数据", len(raw))
                 return None  # 不完整帧，等待后续数据
             return json.loads(buf.decode("utf-8"))
         return json.loads(raw)
@@ -496,6 +518,7 @@ class GatewayClient:
         Args:
             payload: 要发送的字典
         """
+        log.debug("发送 Gateway 消息: op=%s", payload.get("op"))
         await self._ws.send(json.dumps(payload))
 
     async def _recv(self) -> dict | None:
@@ -506,8 +529,12 @@ class GatewayClient:
         """
         try:
             raw = await self._ws.recv()
-            return self._decode_message(raw)
-        except Exception:
+            msg = self._decode_message(raw)
+            if msg:
+                log.debug("接收 Gateway 消息: op=%s", msg.get("op"))
+            return msg
+        except Exception as e:
+            log.debug("接收消息异常: %s", e)
             return None
 
     # ═════════════════════════════════════════════════════
@@ -522,10 +549,13 @@ class GatewayClient:
         """
         app_id = self.config.application_id
         if not app_id or app_id == "你的ApplicationID":
+            log.debug("未配置 application_id，跳过资产刷新")
             return
+        log.debug("开始获取应用资产: app_id=%s", app_id)
         mapping = await asyncio.to_thread(fetch_app_assets, app_id)
         if mapping:
             self._asset_map = mapping
+            log.debug("资产映射已缓存: %d 个资产", len(mapping))
         elif not self._asset_map:
             log.warning("资产列表为空，将原样使用配置中的字符串作为图标键（可能无法显示图标）")
 
@@ -599,6 +629,7 @@ class GatewayClient:
 
     async def _send_heartbeat(self) -> None:
         """发送心跳包 (Opcode 1)"""
+        log.debug("发送心跳包 (seq=%s)", self._sequence)
         await self._send({"op": OpCode.HEARTBEAT, "d": self._sequence})
 
     async def _update_presence(self) -> None:
@@ -625,7 +656,9 @@ class GatewayClient:
         如果心跳未被 ACK，则认为连接断开并主动关闭。
         """
         # 首次心跳添加随机抖动
-        await asyncio.sleep(self._heartbeat_interval * random.random())
+        jitter = self._heartbeat_interval * random.random()
+        log.debug("心跳循环启动，首次抖动: %.2fs, 间隔: %.2fs", jitter, self._heartbeat_interval)
+        await asyncio.sleep(jitter)
 
         while True:
             if not self._heartbeat_acked:
@@ -644,6 +677,7 @@ class GatewayClient:
         有变更时重载配置并刷新 Presence。
         """
         interval = self.config.config_reload_interval
+        log.debug("配置热更新循环启动，检查间隔: %ds", interval)
 
         while True:
             await asyncio.sleep(interval)
@@ -666,9 +700,10 @@ class GatewayClient:
 
         设置运行标记为 False，保存运行时间，主循环将在当前迭代结束后退出。
         """
+        log.info("收到停止信号，准备优雅关闭...")
         self._running = False
         self._save_elapsed_time()
-        log.info("收到停止信号")
+        log.info("客户端已停止")
 
     def _save_elapsed_time(self) -> None:
         """保存 auto 模式下的已运行时间到 config.yml
@@ -678,6 +713,7 @@ class GatewayClient:
         """
         if self.config.start_time_mode == "auto":
             elapsed_minutes = (time.time() - self.start_ts) / 60
+            log.debug("保存 auto 模式运行时间: %.1f 分钟", elapsed_minutes)
             try:
                 self.config.save_auto_minutes(elapsed_minutes)
             except Exception as e:
